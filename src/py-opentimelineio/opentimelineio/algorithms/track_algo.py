@@ -20,6 +20,14 @@ def track_trimmed_to_range(in_track, trim_range):
 
     .. note:: The track is never expanded, only shortened.
 
+    The trim_range is expressed in the track's parent space (the timeline's
+    space). The resulting track's duration is the intersection of the
+    trim_range with the range the track originally presented. Items fully
+    inside the trim_range are left untouched, items partially overlapped
+    are trimmed at the boundary, and any blank space between the start of
+    the trim_range and the first remaining item is preserved as a
+    :py:class:`.Gap` so the remaining content does not slip forward.
+
     Please note that you could do nearly the same thing non-destructively by
     just setting the :py:class:`.Track`\'s source_range but sometimes you want
     to really cut away the stuff outside and that's what this function is meant for.
@@ -31,48 +39,159 @@ def track_trimmed_to_range(in_track, trim_range):
     """
     new_track = copy.deepcopy(in_track)
 
+    # The trim_range is expressed in the track's parent space. If the track
+    # has a source_range, its children live in a different space, so figure
+    # out which part of the child space the trim_range refers to.
+    if new_track.source_range is not None:
+        presented_range = new_track.source_range
+    else:
+        presented_range = opentime.TimeRange(
+            start_time=opentime.RationalTime(
+                0,
+                trim_range.start_time.rate
+            ),
+            duration=new_track.duration()
+        )
+
+    # map the trim_range into the track's child space
+    child_trim_range = opentime.TimeRange(
+        start_time=trim_range.start_time + presented_range.start_time,
+        duration=trim_range.duration
+    )
+
+    # only the part of the trim range that overlaps the range the track
+    # actually presents can produce any output
+    keep_start = max(
+        child_trim_range.start_time,
+        presented_range.start_time
+    )
+    keep_end = min(
+        child_trim_range.end_time_exclusive(),
+        presented_range.end_time_exclusive()
+    )
+
+    if keep_end <= keep_start:
+        # the trim range does not overlap this track at all
+        del new_track[:]
+        new_track.source_range = None
+        return new_track
+
+    keep_range = opentime.range_from_start_end_time(keep_start, keep_end)
+
+    if keep_range == presented_range:
+        # the trim range covers the whole track, nothing to trim
+        return new_track
+
     track_map = new_track.range_of_all_children()
 
     # iterate backwards so we can delete items
     for c, child in reversed(list(enumerate(new_track))):
         child_range = track_map[child]
-        if not trim_range.intersects(child_range):
+        if not keep_range.intersects(child_range):
             # completely outside the trim range, so we discard it
             del new_track[c]
-        elif trim_range.contains(child_range):
-            # completely contained, keep the whole thing
-            pass
-        else:
-            if isinstance(child, schema.Transition):
-                raise exceptions.CannotTrimTransitionsError(
-                    "Cannot trim in the middle of a Transition."
+            continue
+
+        # should we trim the start and/or end of this child?
+        trim_the_start = keep_range.start_time > child_range.start_time
+        trim_the_end = (
+            keep_range.end_time_exclusive()
+            < child_range.end_time_exclusive()
+        )
+
+        if not trim_the_start and not trim_the_end:
+            # completely contained (possibly exactly abutting the edges of
+            # the trim range), keep the whole thing as-is
+            continue
+
+        if isinstance(child, schema.Transition):
+            raise exceptions.CannotTrimTransitionsError(
+                "Cannot trim in the middle of a Transition."
+            )
+
+        # we need to clip the end(s)
+        child_source_range = child.trimmed_range()
+
+        # should we trim the start?
+        if trim_the_start:
+            trim_amount = keep_range.start_time - child_range.start_time
+            child_source_range = opentime.TimeRange(
+                start_time=child_source_range.start_time + trim_amount,
+                duration=child_source_range.duration - trim_amount
+
+            )
+
+        # should we trim the end?
+        if trim_the_end:
+            trim_amount = (
+                child_range.end_time_exclusive()
+                - keep_range.end_time_exclusive()
+            )
+            child_source_range = opentime.TimeRange(
+                start_time=child_source_range.start_time,
+                duration=child_source_range.duration - trim_amount
+
+            )
+
+        # set the new child's trims
+        child.source_range = child_source_range
+
+    if len(new_track) > 0:
+        # if the trim range starts before the first remaining child, fill
+        # the blank space with a Gap so the remaining content does not
+        # slip forward
+        first_child_range = track_map[new_track[0]]
+        if first_child_range.start_time > keep_range.start_time:
+            gap_duration = (
+                first_child_range.start_time - keep_range.start_time
+            )
+            new_track.insert(
+                0,
+                schema.Gap(
+                    source_range=opentime.TimeRange(
+                        start_time=opentime.RationalTime(
+                            0,
+                            gap_duration.rate
+                        ),
+                        duration=gap_duration
+                    )
                 )
+            )
 
-            # we need to clip the end(s)
-            child_source_range = child.trimmed_range()
-
-            # should we trim the start?
-            if trim_range.start_time > child_range.start_time:
-                trim_amount = trim_range.start_time - child_range.start_time
-                child_source_range = opentime.TimeRange(
-                    start_time=child_source_range.start_time + trim_amount,
-                    duration=child_source_range.duration - trim_amount
-
+        # same for any blank space at the end of the trim range
+        last_child_range = track_map[new_track[-1]]
+        last_child_end = last_child_range.end_time_exclusive()
+        if last_child_end < keep_range.end_time_exclusive():
+            gap_duration = keep_range.end_time_exclusive() - last_child_end
+            new_track.append(
+                schema.Gap(
+                    source_range=opentime.TimeRange(
+                        start_time=opentime.RationalTime(
+                            0,
+                            gap_duration.rate
+                        ),
+                        duration=gap_duration
+                    )
                 )
-
-            # should we trim the end?
-            trim_end = trim_range.end_time_exclusive()
-            child_end = child_range.end_time_exclusive()
-            if trim_end < child_end:
-                trim_amount = child_end - trim_end
-                child_source_range = opentime.TimeRange(
-                    start_time=child_source_range.start_time,
-                    duration=child_source_range.duration - trim_amount
-
+            )
+    else:
+        # the trim range only covers blank space in this track, preserve
+        # it as a Gap
+        new_track.append(
+            schema.Gap(
+                source_range=opentime.TimeRange(
+                    start_time=opentime.RationalTime(
+                        0,
+                        keep_range.duration.rate
+                    ),
+                    duration=keep_range.duration
                 )
+            )
+        )
 
-            # set the new child's trims
-            child.source_range = child_source_range
+    # the children have been re-based to exactly cover the trimmed range,
+    # so the track no longer needs a source_range of its own
+    new_track.source_range = None
 
     return new_track
 

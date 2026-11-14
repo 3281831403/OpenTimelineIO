@@ -396,6 +396,159 @@ class TrackTrimmingTests(unittest.TestCase, otio_test_utils.OTIOAssertions):
             )
         )
 
+    def test_trim_track_with_source_range(self):
+        # a track that presents frames [-7, 9) of its child space:
+        # 7 frames of blank, then a 9 frame clip
+        original_track = otio.adapters.read_from_string("""
+        {
+            "OTIO_SCHEMA": "Track.1",
+            "children": [
+                {
+                    "OTIO_SCHEMA": "Clip.1",
+                    "effects": [],
+                    "markers": [],
+                    "media_reference": null,
+                    "metadata": {},
+                    "name": "A",
+                    "source_range": {
+                        "OTIO_SCHEMA": "TimeRange.1",
+                        "duration": {
+                            "OTIO_SCHEMA": "RationalTime.1",
+                            "rate": 24,
+                            "value": 9
+                        },
+                        "start_time": {
+                            "OTIO_SCHEMA": "RationalTime.1",
+                            "rate": 24,
+                            "value": 100
+                        }
+                    }
+                }
+            ],
+            "effects": [],
+            "kind": "Video",
+            "markers": [],
+            "metadata": {},
+            "name": "Sequence1",
+            "source_range": {
+                "OTIO_SCHEMA": "TimeRange.1",
+                "duration": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24,
+                    "value": 16
+                },
+                "start_time": {
+                    "OTIO_SCHEMA": "RationalTime.1",
+                    "rate": 24,
+                    "value": -7
+                }
+            }
+        }
+        """, "otio_json")
+
+        # the clip is visible at frames [7, 16) in the parent space;
+        # trimming to [2, 8) should keep 6 frames: 5 blank + 1 of the clip
+        trimmed = otio.algorithms.track_trimmed_to_range(
+            original_track,
+            otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(2, 24),
+                duration=otio.opentime.RationalTime(6, 24)
+            )
+        )
+        self.assertEqual(
+            trimmed.duration(),
+            otio.opentime.RationalTime(6, 24)
+        )
+        self.assertEqual(len(trimmed), 2)
+
+        # the blank before the clip is preserved as a Gap, so the clip
+        # does not slip forward
+        self.assertIsInstance(trimmed[0], otio.schema.Gap)
+        self.assertEqual(
+            trimmed[0].duration(),
+            otio.opentime.RationalTime(5, 24)
+        )
+
+        # the clip shows the first frame of its media
+        self.assertEqual(trimmed[1].name, "A")
+        self.assertEqual(
+            trimmed[1].source_range,
+            otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(100, 24),
+                duration=otio.opentime.RationalTime(1, 24)
+            )
+        )
+        self.assertEqual(
+            trimmed.range_of_child(trimmed[1]),
+            otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(5, 24),
+                duration=otio.opentime.RationalTime(1, 24)
+            )
+        )
+
+        # trimming to a range that covers the whole track changes nothing
+        trimmed = otio.algorithms.track_trimmed_to_range(
+            original_track,
+            otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, 24),
+                duration=otio.opentime.RationalTime(100, 24)
+            )
+        )
+        self.assertIsOTIOEquivalentTo(original_track, trimmed)
+
+        # trimming to exactly the presented range changes nothing either
+        trimmed = otio.algorithms.track_trimmed_to_range(
+            original_track,
+            otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, 24),
+                duration=otio.opentime.RationalTime(16, 24)
+            )
+        )
+        self.assertIsOTIOEquivalentTo(original_track, trimmed)
+
+    def test_trim_leaves_abutting_clips_alone(self):
+        avail_tr = otio.opentime.TimeRange(
+            otio.opentime.RationalTime(0, 24),
+            otio.opentime.RationalTime(50, 24)
+        )
+        mr = otio.schema.ExternalReference(
+            available_range=avail_tr,
+            target_url="/var/tmp/test.mov"
+        )
+        original_track = otio.schema.Track()
+        # clip A relies on its media_reference, it has no source_range
+        original_track.append(otio.schema.Clip(name="A", media_reference=mr))
+        original_track.append(otio.schema.Clip(
+            name="B",
+            media_reference=mr,
+            source_range=avail_tr
+        ))
+
+        # trim to exactly the first clip: it abuts the end of the trim
+        # range, so it should be kept exactly as-is
+        trimmed = otio.algorithms.track_trimmed_to_range(
+            original_track,
+            otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(0, 24),
+                duration=otio.opentime.RationalTime(50, 24)
+            )
+        )
+        self.assertEqual(len(trimmed), 1)
+        self.assertIsNone(trimmed[0].source_range)
+        self.assertIsOTIOEquivalentTo(trimmed[0], original_track[0])
+
+        # trim to exactly the second clip: it abuts the start of the trim
+        # range, so it should also be kept exactly as-is, with no Gap
+        trimmed = otio.algorithms.track_trimmed_to_range(
+            original_track,
+            otio.opentime.TimeRange(
+                start_time=otio.opentime.RationalTime(50, 24),
+                duration=otio.opentime.RationalTime(50, 24)
+            )
+        )
+        self.assertEqual(len(trimmed), 1)
+        self.assertIsOTIOEquivalentTo(trimmed[0], original_track[1])
+
     def test_trim_with_transitions(self):
         original_track = self.make_sample_track()
         self.assertEqual(
