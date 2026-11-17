@@ -932,6 +932,229 @@ Duration: 00:02:16:18
                  "    MEDIA: file:///folder/credits.mov\n"),
                 out)
 
+    def _make_range(self, start, duration, rate=24):
+        return otio.opentime.TimeRange(
+            otio.opentime.RationalTime(start, rate),
+            otio.opentime.RationalTime(duration, rate)
+        )
+
+    def _write_input_timeline(self, temp_dir, clips):
+        timeline = otio.schema.Timeline("OTIOTool Test Timeline")
+        track = otio.schema.Track("V1")
+        timeline.tracks.append(track)
+        for clip in clips:
+            track.append(clip)
+        input_path = os.path.join(temp_dir, "input.otio")
+        otio.adapters.write_to_file(timeline, input_path)
+        return input_path
+
+    def test_relink_preserves_range_and_metadata(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            media_dir = os.path.join(temp_dir, "media")
+            os.mkdir(media_dir)
+            with open(os.path.join(media_dir, "shot1.mov"), "w") as f:
+                f.write("X")
+
+            reference = otio.schema.ExternalReference(
+                target_url="/missing/shot1.mov",
+                available_range=self._make_range(0, 48)
+            )
+            reference.metadata["tape"] = "AZ001"
+            input_path = self._write_input_timeline(temp_dir, [
+                otio.schema.Clip(
+                    "shot1",
+                    media_reference=reference,
+                    source_range=self._make_range(0, 24)
+                )
+            ])
+            output_path = os.path.join(temp_dir, "output.otio")
+
+            sys.argv = [
+                'otiotool',
+                '-i', input_path,
+                '--relink-by-name', media_dir,
+                '--verify-media',
+                '-o', output_path
+            ]
+            out, err = self.run_test()
+
+            # the relinked file is found by --verify-media
+            self.assertIn(" EXISTS", out)
+            self.assertNotIn("NOT FOUND", out)
+
+            # the relinked reference keeps the timing and metadata of
+            # the original media reference
+            result = otio.adapters.read_from_file(output_path)
+            new_reference = list(result.find_clips())[0].media_reference
+            self.assertEqual(
+                new_reference.available_range,
+                self._make_range(0, 48)
+            )
+            self.assertEqual(new_reference.metadata["tape"], "AZ001")
+
+    def test_copy_media_to_folder(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Two different sources with the same file name, plus a
+            # duplicate reference to one of them via a file:// URL.
+            dir_a = os.path.join(temp_dir, "a")
+            dir_b = os.path.join(temp_dir, "b")
+            os.mkdir(dir_a)
+            os.mkdir(dir_b)
+            with open(os.path.join(dir_a, "shot.mov"), "w") as f:
+                f.write("AAAA")
+            with open(os.path.join(dir_b, "shot.mov"), "w") as f:
+                f.write("BBBBBBBB")
+
+            urls = [
+                os.path.join(dir_a, "shot.mov"),
+                "file://" + os.path.join(dir_a, "shot.mov"),
+                "file://" + os.path.join(dir_b, "shot.mov"),
+            ]
+            clips = [
+                otio.schema.Clip(
+                    f"shot{i}",
+                    media_reference=otio.schema.ExternalReference(
+                        target_url=url,
+                        available_range=self._make_range(0, 24)
+                    ),
+                    source_range=self._make_range(0, 24)
+                )
+                for i, url in enumerate(urls)
+            ]
+            input_path = self._write_input_timeline(temp_dir, clips)
+            output_path = os.path.join(temp_dir, "output.otio")
+            folder = os.path.join(temp_dir, "package")
+            os.mkdir(folder)
+
+            sys.argv = [
+                'otiotool',
+                '-i', input_path,
+                '--copy-media-to-folder', folder,
+                '-o', output_path
+            ]
+            self.run_test()
+
+            # Same-named sources are kept distinct, and identical sources
+            # (plain path and file:// URL) are copied only once.
+            self.assertEqual(
+                sorted(os.listdir(folder)),
+                ["shot.mov", "shot_1.mov"]
+            )
+            with open(os.path.join(folder, "shot.mov")) as f:
+                self.assertEqual(f.read(), "AAAA")
+            with open(os.path.join(folder, "shot_1.mov")) as f:
+                self.assertEqual(f.read(), "BBBBBBBB")
+
+            result = otio.adapters.read_from_file(output_path)
+            result_clips = list(result.find_clips())
+            self.assertEqual(
+                result_clips[0].media_reference.target_url,
+                result_clips[1].media_reference.target_url
+            )
+            self.assertNotEqual(
+                result_clips[0].media_reference.target_url,
+                result_clips[2].media_reference.target_url
+            )
+
+            # Rerunning on the rewritten timeline adds no new files.
+            rerun_path = os.path.join(temp_dir, "rerun.otio")
+            sys.argv = [
+                'otiotool',
+                '-i', output_path,
+                '--copy-media-to-folder', folder,
+                '-o', rerun_path
+            ]
+            self.run_test()
+            self.assertEqual(
+                sorted(os.listdir(folder)),
+                ["shot.mov", "shot_1.mov"]
+            )
+
+    def _make_sequence_clip(self, seq_dir, name="seqclip"):
+        reference = otio.schema.ImageSequenceReference(
+            f"file://{seq_dir}/",
+            "frame.",
+            ".exr",
+            frame_zero_padding=4,
+            start_frame=1,
+            frame_step=1,
+            rate=24,
+            available_range=self._make_range(0, 10)
+        )
+        # the clip uses frames 3-6 of the 1-10 sequence
+        return otio.schema.Clip(
+            name,
+            media_reference=reference,
+            source_range=self._make_range(2, 4)
+        )
+
+    def test_list_media_image_sequence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            seq_dir = os.path.join(temp_dir, "seq")
+            input_path = self._write_input_timeline(
+                temp_dir, [self._make_sequence_clip(seq_dir)]
+            )
+
+            sys.argv = [
+                'otiotool',
+                '-i', input_path,
+                '--list-media'
+            ]
+            out, err = self.run_test()
+
+            # each frame used by the clip is listed
+            for frame in range(3, 7):
+                self.assertIn(
+                    f"    MEDIA: file://{seq_dir}/frame.{frame:04d}.exr\n",
+                    out
+                )
+            self.assertNotIn("frame.0001.exr", out)
+            self.assertNotIn("MEDIA: None", out)
+
+    def test_copy_media_to_folder_image_sequence(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            seq_dir = os.path.join(temp_dir, "seq")
+            os.mkdir(seq_dir)
+            for frame in range(1, 11):
+                with open(
+                        os.path.join(seq_dir, f"frame.{frame:04d}.exr"),
+                        "w") as f:
+                    f.write(f"frame{frame}")
+
+            input_path = self._write_input_timeline(
+                temp_dir, [self._make_sequence_clip(seq_dir)]
+            )
+            output_path = os.path.join(temp_dir, "output.otio")
+            folder = os.path.join(temp_dir, "package")
+            os.mkdir(folder)
+
+            sys.argv = [
+                'otiotool',
+                '-i', input_path,
+                '--copy-media-to-folder', folder,
+                '--verify-media',
+                '-o', output_path
+            ]
+            out, err = self.run_test()
+
+            # only the frames used by the clip were copied
+            self.assertEqual(
+                sorted(os.listdir(folder)),
+                [f"frame.{n:04d}.exr" for n in range(3, 7)]
+            )
+            self.assertNotIn("NOT FOUND", out)
+
+            # each frame of the rewritten reference resolves to its copy
+            result = otio.adapters.read_from_file(output_path)
+            new_reference = list(result.find_clips())[0].media_reference
+            self.assertEqual(new_reference.target_url_base, folder + "/")
+            for image_number in range(2, 6):
+                url = new_reference.target_url_for_image_number(image_number)
+                path = otio.url_utils.filepath_from_url(url)
+                self.assertTrue(os.path.exists(path))
+                with open(path) as f:
+                    self.assertEqual(f.read(), f"frame{image_number + 1}")
+
 
 OTIOToolTest_ShellOut = CreateShelloutTest(OTIOToolTest)
 

@@ -733,14 +733,208 @@ def redact_timeline(timeline):
 
 
 def copy_media(url, destination_path):
-    if url.startswith("/"):
+    # file:// URLs and plain paths both refer to local files
+    source_path = otio.url_utils.filepath_from_url(url)
+    if "://" not in source_path:
         print(f"COPYING: {url}")
-        data = open(url, "rb").read()
+        with open(source_path, "rb") as source_file:
+            data = source_file.read()
     else:
         print(f"DOWNLOADING: {url}")
         data = urlopen(url).read()
-    open(destination_path, "wb").write(data)
+    with open(destination_path, "wb") as destination_file:
+        destination_file.write(data)
     return destination_path
+
+
+def _image_sequence_frames_used(clip, media_reference):
+    """Return the list of image sequence frame numbers that the clip
+    actually uses, or None if they cannot be determined."""
+    available_range = media_reference.available_range
+    if available_range is None:
+        return None
+    try:
+        used_range = clip.trimmed_range()
+    except Exception:
+        return None
+
+    # Clamp to the frames that exist in the sequence
+    start = max(used_range.start_time, available_range.start_time)
+    end = min(
+        used_range.end_time_inclusive(),
+        available_range.end_time_inclusive()
+    )
+    if end < start:
+        return []
+
+    try:
+        first_frame = media_reference.frame_for_time(start)
+        last_frame = media_reference.frame_for_time(end)
+    except Exception:
+        return None
+
+    step = media_reference.frame_step or 1
+    return list(range(first_frame, last_frame + 1, step))
+
+
+def _image_sequence_url_for_frame(media_reference, frame):
+    """Return the URL of the given frame number of an image sequence."""
+    step = media_reference.frame_step or 1
+    image_number = (frame - media_reference.start_frame) // step
+    return media_reference.target_url_for_image_number(image_number)
+
+
+def copy_media_to_folder(timeline, folder):
+    """Copy or download all referenced media to this folder, and relink media
+    references to the copies."""
+
+    # @TODO: Add an option to allow mkdir
+    # if not os.path.exists(folder):
+    #     os.mkdir(folder)
+
+    # Each distinct source is copied only once, even if several clips
+    # reference it. file:// URLs and plain paths to the same file are
+    # considered the same source.
+    destination_for_source = {}
+    # Different sources with the same file name are given distinct
+    # destination names, so they cannot overwrite each other.
+    source_for_dest_name = {}
+
+    def _source_key(url):
+        path = otio.url_utils.filepath_from_url(url)
+        if "://" not in path:
+            path = os.path.abspath(path)
+        return path
+
+    def _claim_dest_name(filename, key):
+        """Return a destination file name within the folder for the given
+        source, made unique if a different source already claimed it."""
+        if (filename not in source_for_dest_name or
+                source_for_dest_name[filename] == key):
+            source_for_dest_name[filename] = key
+            return filename
+        stem, ext = os.path.splitext(filename)
+        index = 1
+        while True:
+            candidate = f"{stem}_{index}{ext}"
+            if (candidate not in source_for_dest_name or
+                    source_for_dest_name[candidate] == key):
+                source_for_dest_name[candidate] = key
+                return candidate
+            index += 1
+
+    def _is_same_file(source_key, destination_path):
+        if "://" in source_key:
+            return False
+        if source_key == os.path.abspath(destination_path):
+            return True
+        try:
+            return os.path.samefile(source_key, destination_path)
+        except OSError:
+            return False
+
+    def _copy_to_folder(url, dest_name):
+        """Copy url into the folder under dest_name if needed, and return
+        the destination path, or None if the media could not be copied."""
+        key = _source_key(url)
+        if key in destination_for_source:
+            return destination_for_source[key]
+        destination_path = os.path.join(folder, dest_name)
+        if (_is_same_file(key, destination_path) and
+                os.path.exists(destination_path)):
+            # The media is already in the folder, nothing to copy. This
+            # keeps rerunning the command from adding new files.
+            pass
+        elif os.path.exists(destination_path):
+            print(
+                "WARNING: Relinking to existing file"
+                " (instead of overwriting it): {}".format(destination_path)
+            )
+        else:
+            try:
+                copy_media(url, destination_path)
+            except Exception as ex:
+                print(f"ERROR: Problem copying/downloading media {ex}")
+                return None
+        destination_for_source[key] = destination_path
+        return destination_path
+
+    def _copy_external_reference(media_reference):
+        url = media_reference.target_url
+        key = _source_key(url)
+        filename = os.path.basename(otio.url_utils.filepath_from_url(url))
+        destination_path = _copy_to_folder(
+            url, _claim_dest_name(filename, key)
+        )
+        if destination_path is not None:
+            media_reference.target_url = destination_path
+
+    def _copy_image_sequence(clip, media_reference):
+        frames = _image_sequence_frames_used(clip, media_reference)
+        if frames is None:
+            print(
+                "WARNING: Cannot determine which frames of the image"
+                f" sequence are used by clip {clip.name};"
+                " it was not copied."
+            )
+            return
+        if not frames:
+            return
+
+        urls = [
+            _image_sequence_url_for_frame(media_reference, frame)
+            for frame in frames
+        ]
+        keys = [_source_key(url) for url in urls]
+        filenames = [
+            os.path.basename(otio.url_utils.filepath_from_url(url))
+            for url in urls
+        ]
+
+        # The destination names must keep the
+        # "name_prefix + frame number + name_suffix" pattern, otherwise the
+        # rewritten reference could not resolve each frame to its copy.
+        # If any of the frame file names is already claimed by a different
+        # source, adjust the name prefix of the whole sequence instead.
+        prefix = media_reference.name_prefix
+        attempt = 0
+        while True:
+            new_prefix = prefix if attempt == 0 else f"{prefix}_{attempt}"
+            dest_names = [
+                new_prefix + filename[len(prefix):]
+                for filename in filenames
+            ]
+            conflict = any(
+                dest_name in source_for_dest_name and
+                source_for_dest_name[dest_name] != key
+                for dest_name, key in zip(dest_names, keys)
+            )
+            if not conflict:
+                break
+            attempt += 1
+        for dest_name, key in zip(dest_names, keys):
+            source_for_dest_name[dest_name] = key
+
+        for url, dest_name in zip(urls, dest_names):
+            if _copy_to_folder(url, dest_name) is None:
+                # The error was already reported; leave this
+                # reference unchanged.
+                return
+
+        if new_prefix != prefix:
+            media_reference.name_prefix = new_prefix
+        base = folder if folder.endswith("/") else folder + "/"
+        media_reference.target_url_base = base
+
+    for clip in timeline.find_clips():
+        media_reference = clip.media_reference
+        if media_reference is None:
+            continue
+        if isinstance(media_reference, otio.schema.ImageSequenceReference):
+            _copy_image_sequence(clip, media_reference)
+        elif (hasattr(media_reference, 'target_url') and
+                media_reference.target_url):
+            _copy_external_reference(media_reference)
 
 
 def relink_by_name(timeline, path):
@@ -775,54 +969,18 @@ def relink_by_name(timeline, path):
     for clip in timeline.find_clips():
         url = name_to_url.get(clip.name)
         if url is not None:
-            clip.media_reference = otio.schema.ExternalReference(target_url=url)
+            old_reference = clip.media_reference
+            new_reference = otio.schema.ExternalReference(target_url=url)
+            if old_reference is not None:
+                # Relinking only changes which file the reference points
+                # to. The timing and metadata of the previous reference
+                # still apply, so carry them over to the new one.
+                new_reference.available_range = old_reference.available_range
+                new_reference.metadata.update(old_reference.metadata)
+            clip.media_reference = new_reference
             count += 1
 
     print(f"Relinked {count} clips to files in folder {path}")
-
-
-def copy_media_to_folder(timeline, folder):
-    """Copy or download all referenced media to this folder, and relink media
-    references to the copies."""
-
-    # @TODO: Add an option to allow mkdir
-    # if not os.path.exists(folder):
-    #     os.mkdir(folder)
-
-    copied_files = set()
-    for clip in timeline.find_clips():
-        media_reference = clip.media_reference
-        has_actual_url = (media_reference and
-                          hasattr(media_reference, 'target_url') and
-                          media_reference.target_url)
-        if has_actual_url:
-            source_url = media_reference.target_url
-            filename = os.path.basename(source_url)
-            # @TODO: This is prone to name collisions if the basename is not unique
-            # We probably need to hash the url, or turn the whole url into a filename.
-            destination_path = os.path.join(folder, filename)
-            already_copied_this = destination_path in copied_files
-            file_exists = os.path.exists(destination_path)
-            if already_copied_this:
-                media_reference.target_url = destination_path
-            else:
-                if file_exists:
-                    print(
-                        "WARNING: Relinking clip {} to existing file"
-                        " (instead of overwriting it): {}".format(
-                            clip.name, destination_path
-                        )
-                    )
-                    media_reference.target_url = destination_path
-                    already_copied_this.add(destination_path)
-                else:
-                    try:
-                        copy_media(source_url, destination_path)
-                        media_reference.target_url = destination_path
-                        already_copied_this.add(destination_path)
-                    except Exception as ex:
-                        print(f"ERROR: Problem copying/downloading media {ex}")
-                        # don't relink this one, since the copy failed
 
 
 def print_timeline_stats(timeline):
@@ -912,17 +1070,55 @@ def summarize_timeline(list_tracks, list_clips, list_media, verify_media,
                 else:
                     print("  CLIP:", child.name)
             if list_media or verify_media:
-                try:
-                    url = child.media_reference.target_url
-                except Exception:
-                    url = None
-                detail = ""
-                if verify_media and url:
-                    if os.path.exists(url):
-                        detail = " EXISTS"
+                media_reference = child.media_reference
+                if isinstance(
+                        media_reference,
+                        otio.schema.ImageSequenceReference):
+                    # An image sequence references one file per frame;
+                    # list each frame the clip actually uses.
+                    frames = _image_sequence_frames_used(
+                        child, media_reference
+                    )
+                    if frames is None:
+                        urls = [
+                            media_reference.abstract_target_url(
+                                "#" * max(
+                                    1, media_reference.frame_zero_padding
+                                )
+                            )
+                        ]
+                        verify_urls = False
                     else:
-                        detail = " NOT FOUND"
-                print(f"    MEDIA{detail}: {url}")
+                        urls = [
+                            _image_sequence_url_for_frame(
+                                media_reference, frame
+                            )
+                            for frame in frames
+                        ]
+                        verify_urls = True
+                    for url in urls:
+                        detail = ""
+                        if verify_media and verify_urls:
+                            if os.path.exists(
+                                    otio.url_utils.filepath_from_url(url)):
+                                detail = " EXISTS"
+                            else:
+                                detail = " NOT FOUND"
+                        print(f"    MEDIA{detail}: {url}")
+                else:
+                    try:
+                        url = media_reference.target_url
+                    except Exception:
+                        url = None
+                    detail = ""
+                    if verify_media and url:
+                        # file:// URLs and plain paths are equivalent
+                        if os.path.exists(
+                                otio.url_utils.filepath_from_url(url)):
+                            detail = " EXISTS"
+                        else:
+                            detail = " NOT FOUND"
+                    print(f"    MEDIA{detail}: {url}")
 
         if list_markers and hasattr(child, 'markers'):
             top_level = child

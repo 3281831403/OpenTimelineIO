@@ -4,7 +4,7 @@
 """Utilities for conversion between URLs and file paths."""
 
 import os
-import urllib
+import urllib.parse
 import pathlib
 
 from ._otio import bundle
@@ -25,7 +25,12 @@ def url_from_filepath(fpath):
     try:
         # appears to handle absolute windows paths better, which are absolute
         # and start with a drive letter.
-        return urllib.parse.unquote(pathlib.PurePath(fpath).as_uri())
+        #
+        # Note: the result is intentionally left percent-encoded. Decoding
+        # it here would reintroduce literal characters such as '#' or '%'
+        # which filepath_from_url() would then misinterpret, breaking the
+        # round trip for paths that contain them.
+        return pathlib.PurePath(fpath).as_uri()
     except ValueError:
         # scheme is "file" for absolute paths, else ""
         scheme = "file" if os.path.isabs(fpath) else ""

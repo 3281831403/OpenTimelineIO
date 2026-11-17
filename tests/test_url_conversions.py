@@ -59,6 +59,32 @@ class TestConversions(unittest.TestCase):
             "http://example.com/foo",
         )
 
+    def test_roundtrip_special_characters(self):
+        # Characters that are significant in URLs ('#', '%', spaces,
+        # non-ASCII) must survive the path -> url -> path round trip.
+        for path in (
+                "/tmp/a b#c.mov",
+                "/tmp/100%.mov",
+                "/tmp/100%25.mov",
+                "/tmp/ünïcode #2.exr"):
+            url = otio.url_utils.url_from_filepath(path)
+            self.assertEqual(
+                otio.url_utils.filepath_from_url(url),
+                path
+            )
+
+    def test_file_url_and_plain_path_are_equivalent(self):
+        # A file:// URL and the corresponding plain path resolve to
+        # the same file.
+        self.assertEqual(
+            otio.url_utils.filepath_from_url("file:///tmp/dir/thing.mov"),
+            "/tmp/dir/thing.mov"
+        )
+        self.assertEqual(
+            otio.url_utils.filepath_from_url("/tmp/dir/thing.mov"),
+            "/tmp/dir/thing.mov"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
